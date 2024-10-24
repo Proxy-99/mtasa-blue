@@ -6,11 +6,11 @@ premake.modules.install_cef = {}
 local CEF_PATH = "vendor/cef3/cef/"
 local CEF_TEMP_PATH = "vendor/cef3/"
 local CEF_URL_PREFIX = "https://cef-builds.spotifycdn.com/cef_binary_"
-local CEF_URL_SUFFIX = "_windows32_beta_minimal.tar.bz2"
+local CEF_URL_SUFFIX = "_windows32_minimal.tar.bz2"
 
 -- Change here to update CEF version
-local CEF_VERSION = "129.0.4+g9774348+chromium-129.0.6668.29"
-local CEF_HASH = "70b021ac8921de30c31241d85be8ad5abc65adec4283aff726600319f27034b1"
+local CEF_VERSION = "130.1.2+g48f3ef6+chromium-130.0.6723.44"
+local CEF_HASH = "f436f0f23caa8167d14e8de331d15fbb534e411f4235895024c2e242510e8deb"
 
 function make_cef_download_url()
 	return CEF_URL_PREFIX..http.escapeUrlParam(CEF_VERSION)..CEF_URL_SUFFIX
