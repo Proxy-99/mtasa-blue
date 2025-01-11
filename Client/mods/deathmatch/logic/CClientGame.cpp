@@ -34,6 +34,7 @@
 #include <game/Task.h>
 #include <game/CBuildingRemoval.h>
 #include "game/CClock.h"
+#include <game/CProjectileInfo.h>
 #include <windowsx.h>
 #include "CServerInfo.h"
 
@@ -135,6 +136,7 @@ CClientGame::CClientGame(bool bLocalPlay) : m_ServerInfo(new CServerInfo())
     m_Glitches[GLITCH_BADDRIVEBYHITBOX] = false;
     m_Glitches[GLITCH_QUICKSTAND] = false;
     m_Glitches[GLITCH_KICKOUTOFVEHICLE_ONMODELREPLACE] = false;
+
     g_pMultiplayer->DisableBadDrivebyHitboxes(true);
 
     // Remove Night & Thermal vision view (if enabled).
@@ -227,7 +229,7 @@ CClientGame::CClientGame(bool bLocalPlay) : m_ServerInfo(new CServerInfo())
     m_pObjectSync = new CObjectSync(m_pObjectManager);
 #endif
     m_pNametags = new CNametags(m_pManager);
-    m_pRadarMap = new CRadarMap(m_pManager);
+    m_pPlayerMap = new CPlayerMap(m_pManager);
 
     // Set the screenshot path
     /* This is now done in CCore, to maintain a global screenshot path
@@ -402,6 +404,10 @@ CClientGame::CClientGame(bool bLocalPlay) : m_ServerInfo(new CServerInfo())
 CClientGame::~CClientGame()
 {
     m_bBeingDeleted = true;
+    // Remove active projectile references to local player
+    if (auto pLocalPlayer = g_pClientGame->GetLocalPlayer())
+        g_pGame->GetProjectileInfo()->RemoveEntityReferences(pLocalPlayer->GetGameEntity());    
+
     // Stop all explosions. Unfortunately this doesn't fix the crash
     // if a vehicle is destroyed while it explodes.
     g_pGame->GetExplosionManager()->RemoveAllExplosions();
@@ -548,7 +554,7 @@ CClientGame::~CClientGame()
 #endif
     SAFE_DELETE(m_pBlendedWeather);
     SAFE_DELETE(m_pMovingObjectsManager);
-    SAFE_DELETE(m_pRadarMap);
+    SAFE_DELETE(m_pPlayerMap);
     SAFE_DELETE(m_pRemoteCalls);
     SAFE_DELETE(m_pLuaManager);
     SAFE_DELETE(m_pLatentTransferManager);
@@ -1097,7 +1103,7 @@ void CClientGame::DoPulsePostFrame()
         CClientPerfStatManager::GetSingleton()->DoPulse();
     }
 
-    m_pRadarMap->DoRender();
+    m_pPlayerMap->DoRender();
     m_pManager->DoRender();
     DoPulses();
 
@@ -1435,8 +1441,8 @@ void CClientGame::DoPulses()
     }
 
     // Check for radar input
-    m_pRadarMap->DoPulse();
-    g_pCore->GetGraphics()->SetAspectRatioAdjustmentSuspended(m_pRadarMap->IsRadarShowing());
+    m_pPlayerMap->DoPulse();
+    g_pCore->GetGraphics()->SetAspectRatioAdjustmentSuspended(m_pPlayerMap->IsPlayerMapShowing());
 
     // Got a local player?
     if (m_pLocalPlayer)
@@ -2778,6 +2784,7 @@ void CClientGame::AddBuiltInEvents()
     m_Events.AddEvent("onClientBrowserTooltip", "text", NULL, false);
     m_Events.AddEvent("onClientBrowserInputFocusChanged", "gainedfocus", NULL, false);
     m_Events.AddEvent("onClientBrowserResourceBlocked", "url, domain, reason", NULL, false);
+    m_Events.AddEvent("onClientBrowserConsoleMessage", "message, source, line, level", nullptr, false);
 
     // Misc events
     m_Events.AddEvent("onClientFileDownloadComplete", "fileName, success", NULL, false);
@@ -3078,6 +3085,7 @@ void CClientGame::UpdateMimics()
             bool  bSunbathing = m_pLocalPlayer->IsSunbathing();
             bool  bDoingDriveby = m_pLocalPlayer->IsDoingGangDriveby();
             bool  bStealthAiming = m_pLocalPlayer->IsStealthAiming();
+            bool  reloadingWeapon = m_pLocalPlayer->IsReloadingWeapon();
 
             // Is the current weapon goggles (44 or 45) or a camera (43), or a detonator (40), don't apply the fire key
             if (weaponSlot == 11 || weaponSlot == 12 || ucWeaponType == 43)
@@ -3135,6 +3143,9 @@ void CClientGame::UpdateMimics()
                 pMimic->SetSunbathing(bSunbathing);
                 pMimic->SetDoingGangDriveby(bDoingDriveby);
                 pMimic->SetStealthAiming(bStealthAiming);
+
+                if (reloadingWeapon)
+                    pMimic->ReloadWeapon();
 
                 Controller.ShockButtonL = 0;
 
@@ -3421,6 +3432,9 @@ void CClientGame::Event_OnIngame()
     pHud->SetComponentVisible(HUD_VITAL_STATS, false);
     pHud->SetComponentVisible(HUD_AREA_NAME, false);
 
+    // Reset properties
+    CLuaPlayerDefs::ResetPlayerHudComponentProperty(HUD_ALL, eHudComponentProperty::ALL_PROPERTIES);
+
     g_pMultiplayer->DeleteAndDisableGangTags();
 
     g_pGame->GetBuildingRemoval()->ClearRemovedBuildingLists();
@@ -3430,6 +3444,9 @@ void CClientGame::Event_OnIngame()
     g_pGame->ResetModelFlags();
     g_pGame->ResetAlphaTransparencies();
     g_pGame->ResetModelTimes();
+
+    // Reset weapon render
+    g_pGame->SetWeaponRenderEnabled(true);
 
     // Make sure we can access all areas
     g_pGame->GetStats()->ModifyStat(CITIES_PASSED, 2.0);
@@ -4394,12 +4411,9 @@ bool CClientGame::ApplyPedDamageFromGame(eWeaponType weaponUsed, float fDamage, 
             return false;
         }
 
-        if (pDamagedPed->IsLocalPlayer())
-        {
-            // Reget values in case they have been changed during onClientPlayerDamage event (Avoid AC#1 kick)
-            fCurrentHealth = pDamagedPed->GetGamePlayer()->GetHealth();
-            fCurrentArmor = pDamagedPed->GetGamePlayer()->GetArmor();
-        }
+        // Reget values in case they have been changed during onClientPlayerDamage/onClientPedDamage event (Avoid AC#1 kick)
+        fCurrentHealth = pDamagedPed->GetGamePlayer()->GetHealth();
+        fCurrentArmor = pDamagedPed->GetGamePlayer()->GetArmor();
 
         bool bIsBeingShotWhilstAiming = (weaponUsed >= WEAPONTYPE_PISTOL && weaponUsed <= WEAPONTYPE_MINIGUN && pDamagedPed->IsUsingGun());
         bool bOldBehaviour = !IsGlitchEnabled(GLITCH_HITANIM);
@@ -5406,8 +5420,8 @@ void CClientGame::ResetMapInfo()
     // Keybinds
     g_pCore->GetKeyBinds()->SetAllControlsEnabled(true, true, true);
 
-    // Radarmap
-    m_pRadarMap->SetForcedState(false);
+    // Player map
+    m_pPlayerMap->SetForcedState(false);
 
     // Camera
     m_pCamera->FadeOut(0.0f, 0, 0, 0);
@@ -5981,7 +5995,7 @@ bool CClientGame::IsGlitchEnabled(unsigned char ucGlitch)
     return ucGlitch < NUM_GLITCHES && m_Glitches[ucGlitch];
 }
 
-bool CClientGame::SetWorldSpecialProperty(WorldSpecialProperty property, bool isEnabled)
+bool CClientGame::SetWorldSpecialProperty(WorldSpecialProperty property, bool isEnabled) noexcept
 {
     switch (property)
     {
@@ -5989,44 +6003,63 @@ bool CClientGame::SetWorldSpecialProperty(WorldSpecialProperty property, bool is
         case WorldSpecialProperty::AIRCARS:
         case WorldSpecialProperty::EXTRABUNNY:
         case WorldSpecialProperty::EXTRAJUMP:
-            return g_pGame->SetCheatEnabled(EnumToString(property), isEnabled);
+            g_pGame->SetCheatEnabled(EnumToString(property), isEnabled);
+            break;
         case WorldSpecialProperty::RANDOMFOLIAGE:
             g_pGame->SetRandomFoliageEnabled(isEnabled);
-            return true;
+            break;
         case WorldSpecialProperty::SNIPERMOON:
             g_pGame->SetMoonEasterEggEnabled(isEnabled);
-            return true;
+            break;
         case WorldSpecialProperty::EXTRAAIRRESISTANCE:
             g_pGame->SetExtraAirResistanceEnabled(isEnabled);
-            return true;
+            break;
         case WorldSpecialProperty::UNDERWORLDWARP:
             g_pGame->SetUnderWorldWarpEnabled(isEnabled);
-            return true;
+            break;
         case WorldSpecialProperty::VEHICLESUNGLARE:
             g_pGame->SetVehicleSunGlareEnabled(isEnabled);
-            return true;
+            break;
         case WorldSpecialProperty::CORONAZTEST:
             g_pGame->SetCoronaZTestEnabled(isEnabled);
-            return true;
+            break;
         case WorldSpecialProperty::WATERCREATURES:
             g_pGame->SetWaterCreaturesEnabled(isEnabled);
-            return true;
+            break;
         case WorldSpecialProperty::BURNFLIPPEDCARS:
             g_pGame->SetBurnFlippedCarsEnabled(isEnabled);
-            return true;
+            break;
         case WorldSpecialProperty::FIREBALLDESTRUCT:
             g_pGame->SetFireballDestructEnabled(isEnabled);
-            return true;
+            break;
         case WorldSpecialProperty::EXTENDEDWATERCANNONS:
             g_pGame->SetExtendedWaterCannonsEnabled(isEnabled);
+            break;
         case WorldSpecialProperty::ROADSIGNSTEXT:
             g_pGame->SetRoadSignsTextEnabled(isEnabled);
-            return true;
+            break;
         case WorldSpecialProperty::TUNNELWEATHERBLEND:
             g_pGame->SetTunnelWeatherBlendEnabled(isEnabled);
-            return true;
+            break;
+        case WorldSpecialProperty::IGNOREFIRESTATE:
+            g_pGame->SetIgnoreFireStateEnabled(isEnabled);
+            break;
+        case WorldSpecialProperty::FLYINGCOMPONENTS:
+            m_pVehicleManager->SetSpawnFlyingComponentEnabled(isEnabled);
+            break;
+        default:
+            return false;
     }
-    return false;
+
+    if (g_pNet->CanServerBitStream(eBitStreamVersion::WorldSpecialPropertyEvent)) {
+        NetBitStreamInterface* stream = g_pNet->AllocateNetBitStream();
+        stream->WriteString(EnumToString(property));
+        stream->WriteBit(isEnabled);
+        g_pNet->SendPacket(PACKET_ID_PLAYER_WORLD_SPECIAL_PROPERTY, stream, PACKET_PRIORITY_HIGH, PACKET_RELIABILITY_RELIABLE_ORDERED);
+        g_pNet->DeallocateNetBitStream(stream);
+    }
+
+    return true;
 }
 
 bool CClientGame::IsWorldSpecialProperty(WorldSpecialProperty property)
@@ -6062,6 +6095,10 @@ bool CClientGame::IsWorldSpecialProperty(WorldSpecialProperty property)
             return g_pGame->IsRoadSignsTextEnabled();
         case WorldSpecialProperty::TUNNELWEATHERBLEND:
             return g_pGame->IsTunnelWeatherBlendEnabled();
+        case WorldSpecialProperty::IGNOREFIRESTATE:
+            return g_pGame->IsIgnoreFireStateEnabled();
+        case WorldSpecialProperty::FLYINGCOMPONENTS:
+            return m_pVehicleManager->IsSpawnFlyingComponentEnabled();
     }
     return false;
 }
@@ -6084,6 +6121,16 @@ bool CClientGame::SetBirdsEnabled(bool bEnabled)
 bool CClientGame::GetBirdsEnabled()
 {
     return m_bBirdsEnabled;
+}
+
+void CClientGame::SetWeaponRenderEnabled(bool enabled)
+{
+    g_pGame->SetWeaponRenderEnabled(enabled);
+}
+
+bool CClientGame::IsWeaponRenderEnabled() const
+{
+    return g_pGame->IsWeaponRenderEnabled();
 }
 
 #pragma code_seg(".text")
@@ -6475,7 +6522,7 @@ void CClientGame::OutputServerInfo()
     {
         SString     strEnabledGlitches;
         const char* szGlitchNames[] = {"Quick reload",         "Fast fire",  "Fast move", "Crouch bug", "Close damage", "Hit anim", "Fast sprint",
-                                       "Bad driveby hitboxes", "Quick stand"};
+                                       "Bad driveby hitboxes", "Quick stand", "Kickout of vehicle on model replace"};
         for (uint i = 0; i < NUM_GLITCHES; i++)
         {
             if (IsGlitchEnabled(i))
